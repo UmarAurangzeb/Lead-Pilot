@@ -71,7 +71,7 @@ def score_lead(lead: dict, niche: str) -> int:
         return 0
 
     score = 35  # email found
-    score += _review_score(lead.get("reviewsCount", 0))
+    score += _review_score(int(lead.get("reviewsCount") or 0))
     score += _rating_score(float(lead.get("totalScore") or 0))
     if lead.get("website"):
         score += 10

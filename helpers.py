@@ -101,8 +101,8 @@ def _normalize_place(item: dict) -> dict:
         "title": item.get("title"),
         "address": item.get("address"),
         "website": item.get("website"),
-        "reviewsCount": item.get("reviewsCount", 0),
-        "totalScore": item.get("rating", 0),
+        "reviewsCount": int(item.get("reviewsCount") or 0),
+        "totalScore": float(item.get("rating") or 0),
         "phone": item.get("phone"),
         "category": item.get("categoryName"),
     }
