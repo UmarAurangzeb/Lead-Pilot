@@ -148,7 +148,9 @@ def enrich_leads_with_emails(raw_leads: list[dict]) -> list[dict]:
 
     scraped = json.loads(proc.stdout.decode("utf-8"))
     skip_mx = os.getenv("EMAIL_MX_CHECK", "true").lower() in ("0", "false", "no")
-    skip_fallback = os.getenv("EMAIL_PATTERN_FALLBACK", "true").lower() in ("0", "false", "no")
+    # Pattern fallback is OFF by default — only synthesise info@/contact@ etc.
+    # if the user explicitly opts in. Real scraped emails only by default.
+    use_fallback = os.getenv("EMAIL_PATTERN_FALLBACK", "false").lower() in ("1", "true", "yes")
 
     enriched = []
     for lead in scraped:
@@ -156,7 +158,7 @@ def enrich_leads_with_emails(raw_leads: list[dict]) -> list[dict]:
         if not skip_mx and emails:
             emails = mx_filter(emails)
 
-        if not emails and not skip_fallback:
+        if not emails and use_fallback:
             candidates = fallback_emails_for_website(lead.get("website"))
             emails = normalize_email_list(candidates)
 

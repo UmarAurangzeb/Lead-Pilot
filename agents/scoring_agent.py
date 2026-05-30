@@ -13,12 +13,17 @@ Threshold: ≥ 40 = high quality, < 40 = rejected.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 from a2a.types import AgentCard, AgentSkill, Artifact, Task, TaskResult
 from agents.base import A2AAgent
 from helpers import _lead_hash, normalize_email_list
 from llm import call_llm
+
+# LLM relevance scoring fires one OpenAI call per unique (category, niche).
+# It's the slowest part of scoring — opt-in only via env var.
+_USE_LLM_RELEVANCE = os.getenv("SCORE_LLM_RELEVANCE", "false").lower() in ("1", "true", "yes")
 
 
 def _review_score(count: int) -> int:
@@ -65,6 +70,30 @@ def _llm_category_relevance(category: str, niche: str) -> int:
         return 5
 
 
+def _heuristic_category_relevance(category: str, niche: str) -> int:
+    """Cheap keyword-overlap relevance — no LLM call."""
+    if not category or not niche:
+        return 5
+    cat = category.lower()
+    n = niche.lower()
+    if n in cat or cat in n:
+        return 15
+    cat_tokens = {t for t in _split_tokens(cat) if len(t) > 3}
+    niche_tokens = {t for t in _split_tokens(n) if len(t) > 3}
+    if not cat_tokens or not niche_tokens:
+        return 5
+    overlap = len(cat_tokens & niche_tokens)
+    if overlap >= 2:
+        return 12
+    if overlap == 1:
+        return 8
+    return 3
+
+
+def _split_tokens(text: str) -> list[str]:
+    return [t for t in __import__("re").split(r"[^a-z0-9]+", text) if t]
+
+
 def score_lead(lead: dict, niche: str) -> int:
     emails = normalize_email_list(lead.get("emails", []))
     if not emails:
@@ -77,7 +106,11 @@ def score_lead(lead: dict, niche: str) -> int:
         score += 10
     if lead.get("phone"):
         score += 5
-    score += _llm_category_relevance(lead.get("category") or "", niche)
+    category = lead.get("category") or ""
+    if _USE_LLM_RELEVANCE:
+        score += _llm_category_relevance(category, niche)
+    else:
+        score += _heuristic_category_relevance(category, niche)
     return min(score, 100)
 
 

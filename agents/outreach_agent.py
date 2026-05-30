@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import memory
 from a2a.types import AgentCard, AgentSkill, Artifact, Task, TaskResult
@@ -15,6 +16,8 @@ from agents.base import A2AAgent
 from helpers import normalize_email_list
 from templates import build_email, select_portfolio
 from utils.smtp import send_email
+
+_OUTREACH_CONCURRENCY = int(os.getenv("OUTREACH_CONCURRENCY", "5"))
 
 log = logging.getLogger(__name__)
 
@@ -113,17 +116,13 @@ class OutreachAgent(A2AAgent):
         portfolio = select_portfolio(niche)
         log.info("Outreach using portfolio: %s for niche '%s'", portfolio["name"], niche)
 
-        log_entries: list[str] = []
-
-        for lead in high_quality:
+        def _process(lead: dict) -> str:
             recipients = normalize_email_list(lead.get("emails"))
             if not recipients:
-                log_entries.append(f"skip:no-email:{lead.get('title')}")
-                continue
+                return f"skip:no-email:{lead.get('title')}"
 
             title = lead.get("title") or "your business"
             address = lead.get("address") or ""
-            # crude location: last comma-separated segment of address
             location = address.split(",")[-1].strip() if address else ""
             primary = recipients[0]
             cc = recipients[1:] if len(recipients) > 1 else None
@@ -136,14 +135,14 @@ class OutreachAgent(A2AAgent):
             )
 
             if dry_run:
-                log_entries.append(f"dry-run:{title}:{primary}:template={portfolio['name']}")
-                continue
+                return f"dry-run:{title}:{primary}:template={portfolio['name']}"
 
             sent = False
+            entry = ""
             if _mcp.available:
                 sent = _mcp.send(to=primary, subject=subject, html_body=html_body)
                 if sent:
-                    log_entries.append(f"sent(mcp):{title}:{primary}")
+                    entry = f"sent(mcp):{title}:{primary}"
 
             if not sent:
                 try:
@@ -161,16 +160,28 @@ class OutreachAgent(A2AAgent):
                         html_body=html_body,
                         cc=cc,
                     )
-                    log_entries.append(f"sent(smtp):{title}:{primary}")
+                    entry = f"sent(smtp):{title}:{primary}"
                     sent = True
                 except Exception as exc:
-                    log_entries.append(f"error:{title}:{primary}:{exc}")
+                    entry = f"error:{title}:{primary}:{exc}"
 
             if sent:
                 try:
                     memory.update_status(lead["lead_hash"], "CONTACTED")
                 except Exception:
                     pass
+            return entry
+
+        log_entries: list[str] = []
+        # Parallelize sends — SMTP is IO-bound, so threads are fine and give
+        # near-linear speedup up to the SMTP server's connection limits.
+        with ThreadPoolExecutor(max_workers=_OUTREACH_CONCURRENCY) as pool:
+            futures = [pool.submit(_process, lead) for lead in high_quality]
+            for f in as_completed(futures):
+                try:
+                    log_entries.append(f.result())
+                except Exception as exc:
+                    log_entries.append(f"error:processing:{exc}")
 
         return TaskResult(
             task_id=task.id,
