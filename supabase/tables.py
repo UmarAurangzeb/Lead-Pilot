@@ -11,7 +11,9 @@ CREATE TABLE IF NOT EXISTS leads (
     reviews_count INT,
     score FLOAT,
     lead_hash TEXT UNIQUE,
-    status TEXT DEFAULT 'NEW'
+    status TEXT DEFAULT 'NEW',
+    emails TEXT,
+    niche TEXT
 );
 """)
 

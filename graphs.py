@@ -24,9 +24,10 @@ graph.add_conditional_edges(
     route_function,
     {
         "outreach": "outreach",
-        "query_optimizer": "query_optimizer"
-    }
-),
+        "query_optimizer": "query_optimizer",
+        END: END,
+    },
+)
 graph.add_edge("query_optimizer", "query_generator")
 graph.add_edge("outreach", END)
 

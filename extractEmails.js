@@ -1,16 +1,57 @@
 const { chromium } = require("playwright");
 
-const EMAIL_REGEX = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}/g;
+const EMAIL_REGEX = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
+
+// Matches obfuscated patterns like "name [at] domain [dot] com", "name (at) domain dot com"
+const OBFUSCATED_REGEX =
+  /([a-zA-Z0-9._%+\-]+)\s*(?:\[at\]|\(at\)|\{at\}|\s+at\s+|@)\s*([a-zA-Z0-9.\-]+)\s*(?:\[dot\]|\(dot\)|\{dot\}|\s+dot\s+|\.)\s*([a-zA-Z]{2,})/gi;
+
+function decodeHtmlEntities(text) {
+  if (!text) return "";
+  return text
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ");
+}
 
 function extractEmailsFromText(text) {
   if (!text || typeof text !== "string") return [];
-  const matches = text.match(EMAIL_REGEX);
-  return matches || [];
+  const decoded = decodeHtmlEntities(text);
+  const found = new Set();
+
+  const direct = decoded.match(EMAIL_REGEX);
+  if (direct) direct.forEach((e) => found.add(e));
+
+  let m;
+  OBFUSCATED_REGEX.lastIndex = 0;
+  while ((m = OBFUSCATED_REGEX.exec(decoded)) !== null) {
+    found.add(`${m[1]}@${m[2]}.${m[3]}`);
+  }
+
+  return Array.from(found);
 }
 
-/** Runs in browser: visible text, text nodes containing "@", and any attribute value containing "@". */
+/** Decode Cloudflare's data-cfemail XOR-obfuscated email. */
+function decodeCfEmail(encoded) {
+  if (!encoded || encoded.length < 2) return null;
+  try {
+    const r = parseInt(encoded.substr(0, 2), 16);
+    let decoded = "";
+    for (let n = 2; n < encoded.length; n += 2) {
+      decoded += String.fromCharCode(parseInt(encoded.substr(n, 2), 16) ^ r);
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+/** Runs in browser: pull visible text, attributes, Cloudflare emails, JSON-LD. */
 function harvestEmailsFromDom() {
   const blobs = [];
+  const cfEmails = [];
+  const jsonLdEmails = [];
 
   if (document.body) {
     blobs.push(document.body.innerText || "");
@@ -22,7 +63,7 @@ function harvestEmailsFromDom() {
     let node;
     while ((node = walker.nextNode())) {
       const v = node.nodeValue || "";
-      if (v.includes("@")) blobs.push(v);
+      if (v.includes("@") || /\[at\]|\(at\)|\s+at\s+/i.test(v)) blobs.push(v);
     }
   }
 
@@ -30,12 +71,42 @@ function harvestEmailsFromDom() {
     const attrs = el.attributes;
     if (!attrs) return;
     for (let i = 0; i < attrs.length; i++) {
+      const name = attrs[i].name;
       const val = attrs[i].value;
-      if (val && val.includes("@")) blobs.push(val);
+      if (!val) continue;
+      if (name === "data-cfemail") {
+        cfEmails.push(val);
+      } else if (val.includes("@")) {
+        blobs.push(val);
+      }
     }
   });
 
-  return blobs.join("\n");
+  document
+    .querySelectorAll('script[type="application/ld+json"]')
+    .forEach((s) => {
+      try {
+        const data = JSON.parse(s.textContent || "{}");
+        const stack = [data];
+        while (stack.length) {
+          const cur = stack.pop();
+          if (!cur) continue;
+          if (typeof cur === "string") {
+            if (cur.includes("@")) jsonLdEmails.push(cur.replace(/^mailto:/, ""));
+            continue;
+          }
+          if (Array.isArray(cur)) {
+            stack.push(...cur);
+            continue;
+          }
+          if (typeof cur === "object") {
+            for (const k of Object.keys(cur)) stack.push(cur[k]);
+          }
+        }
+      } catch {}
+    });
+
+  return { text: blobs.join("\n"), cfEmails, jsonLdEmails };
 }
 
 function normalizeUrl(url) {
@@ -45,6 +116,9 @@ function normalizeUrl(url) {
   if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
   return u;
 }
+
+const SUBPAGE_REGEX =
+  /contact|about|support|help|team|staff|imprint|impressum|legal|privacy|kontakt|reach|connect/i;
 
 async function scrapeEmail(page, url) {
   const normalized = normalizeUrl(url);
@@ -58,37 +132,67 @@ async function scrapeEmail(page, url) {
   }
 
   try {
-    await page.goto(normalized, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto(normalized, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
     visited.add(normalized);
 
     async function extract() {
-      const mailtos = await page.$$eval("a[href^='mailto:']", (links) =>
-        links.map((a) => a.href.replace("mailto:", "").split("?")[0])
-      );
-      mailtos.forEach((e) => emails.add(e));
+      try {
+        const mailtos = await page.$$eval("a[href^='mailto:']", (links) =>
+          links.map((a) => a.href.replace(/^mailto:/i, "").split("?")[0])
+        );
+        mailtos.forEach((e) => emails.add(decodeURIComponent(e)));
+      } catch {}
 
-      const domBlob = await page.evaluate(harvestEmailsFromDom);
-      addFromText(domBlob);
+      try {
+        const harvest = await page.evaluate(harvestEmailsFromDom);
+        addFromText(harvest.text);
+        harvest.cfEmails.forEach((enc) => {
+          const decoded = decodeCfEmail(enc);
+          if (decoded) emails.add(decoded);
+        });
+        harvest.jsonLdEmails.forEach((e) => addFromText(e));
+      } catch {}
 
-      const html = await page.content();
-      addFromText(html);
+      try {
+        const html = await page.content();
+        addFromText(html);
+      } catch {}
     }
+
     await extract();
 
-    const links = await page.$$eval("a[href]", (anchors) =>
-      anchors.map((a) => a.href)
-    );
+    let links = [];
+    try {
+      links = await page.$$eval("a[href]", (anchors) =>
+        anchors.map((a) => a.href).filter(Boolean)
+      );
+    } catch {}
 
-    const internalLinks = links
-      .filter((link) => link.startsWith(normalized))
-      .filter((link) => /contact|about|support|help/i.test(link))
-      .slice(0, 5);
+    const origin = new URL(normalized).origin;
+    const internalLinks = Array.from(
+      new Set(
+        links
+          .filter((link) => {
+            try {
+              return new URL(link).origin === origin;
+            } catch {
+              return false;
+            }
+          })
+          .filter((link) => SUBPAGE_REGEX.test(link))
+      )
+    ).slice(0, 10);
 
     for (const link of internalLinks) {
       if (visited.has(link)) continue;
-
       try {
-        await page.goto(link, { waitUntil: "domcontentloaded", timeout: 15000 });
+        await page.goto(link, {
+          waitUntil: "domcontentloaded",
+          timeout: 15000,
+        });
         visited.add(link);
         await extract();
       } catch (err) {
@@ -120,7 +224,11 @@ async function readStdinJson() {
   }
 
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  });
+  const page = await context.newPage();
 
   const results = [];
 

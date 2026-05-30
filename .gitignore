@@ -1,2 +1,33 @@
-node_modules
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+venv/
+.venv/
+env/
+
+# Node
+node_modules/
+
+# Secrets / local config
 .env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Project artifacts
+firstleads.json
+assets/screenshots/
+notebook/

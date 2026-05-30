@@ -1,70 +1,131 @@
-from helpers import enrich_leads_with_emails, fetch_places, generate_queries
+"""
+LangGraph node functions — each node delegates to its A2A agent via the dispatcher.
+
+The dispatcher is initialised once at module load so agents (and their caches)
+persist across graph iterations within the same run.
+"""
+from __future__ import annotations
+
+from uuid import uuid4
+
+from langgraph.graph import END
+
+import memory
+from a2a import A2ADispatcher, DataPart, Message, Task
+from agents import (
+    EnrichmentAgent,
+    LeadDiscoveryAgent,
+    OutreachAgent,
+    QueryGeneratorAgent,
+    ScoringAgent,
+)
 from state import LeadState
 
-def query_generator(state: LeadState):
-    niche = state.get("niche", "local businesses")
-    countries = state.get("countries") or ["Pakistan"]
-    return {"queries": generate_queries(niche, countries)}
+# ── A2A dispatcher — registered once, shared across all graph nodes ──────────
+
+_dispatcher = A2ADispatcher()
+_dispatcher.register(QueryGeneratorAgent())
+_dispatcher.register(LeadDiscoveryAgent())
+_dispatcher.register(EnrichmentAgent())
+_dispatcher.register(ScoringAgent())
+_dispatcher.register(OutreachAgent())
 
 
-def lead_finder(state: LeadState):
-    queries = state["queries"]
-    raw_leads = fetch_places(queries)
-    return {"raw_leads": raw_leads}
+def _task(agent_name: str, **kwargs) -> Task:
+    return Task(
+        id=str(uuid4()),
+        agent_name=agent_name,
+        message=Message(role="user", parts=[DataPart(data=kwargs)]),
+    )
 
-def enrich_leads(state: LeadState):
-    enriched = enrich_leads_with_emails(state["raw_leads"])
-    return {"enriched_leads": enriched}
 
-def score_leads(state: LeadState):
-    scored = []
+# ── Nodes ────────────────────────────────────────────────────────────────────
 
-    for lead in state["enriched_leads"]:
-        score = 0
+def query_generator(state: LeadState) -> dict:
+    result = _dispatcher.send(_task(
+        "QueryGeneratorAgent",
+        niche=state.get("niche", "local businesses"),
+        countries=state.get("countries") or ["Pakistan"],
+    ))
+    if result.status == "failed":
+        raise RuntimeError(f"QueryGeneratorAgent failed: {result.error}")
+    return {"queries": result.first("queries")}
 
-        if lead["reviewsCount"] > 50:
-            score += 3
-        if not lead.get("website"):
-            score += 5
 
-        lead["score"] = score
-        scored.append(lead)
+def lead_finder(state: LeadState) -> dict:
+    result = _dispatcher.send(_task(
+        "LeadDiscoveryAgent",
+        queries=state["queries"],
+    ))
+    if result.status == "failed":
+        raise RuntimeError(f"LeadDiscoveryAgent failed: {result.error}")
+    return {"raw_leads": result.first("raw_leads")}
 
-    return {"scored_leads": scored}
 
-def route_leads(state: LeadState):
-    high = [l for l in state["scored_leads"] if l["score"] >= 7]
-    low = [l for l in state["scored_leads"] if l["score"] < 7]
+def enrich_leads(state: LeadState) -> dict:
+    result = _dispatcher.send(_task(
+        "EnrichmentAgent",
+        raw_leads=state["raw_leads"],
+    ))
+    if result.status == "failed":
+        raise RuntimeError(f"EnrichmentAgent failed: {result.error}")
+    return {"enriched_leads": result.first("enriched_leads")}
 
-    return {
-        "high_quality": high,
-        "rejected": low
-    }
 
-def route_function(state: LeadState):
-    high_quality = state["high_quality"]
-    rejected = state["rejected"]
-    iterations = state.get("iteration", 0)
-    if high_quality:
+def score_leads(state: LeadState) -> dict:
+    result = _dispatcher.send(_task(
+        "ScoringAgent",
+        enriched_leads=state["enriched_leads"],
+        niche=state.get("niche", "local businesses"),
+    ))
+    if result.status == "failed":
+        raise RuntimeError(f"ScoringAgent failed: {result.error}")
+    scored = result.first("scored_leads") or []
+    summary = result.first("scoring_summary") or {}
+    return {"scored_leads": scored, "scoring_summary": summary}
+
+
+def route_leads(state: LeadState) -> dict:
+    niche = state.get("niche", "")
+    high = [dict(l) for l in state["scored_leads"] if l["score"] >= 40]
+    low  = [dict(l) for l in state["scored_leads"] if l["score"] < 40]
+
+    for l in high:
+        l["status"] = "QUALIFIED"
+        l["niche"] = niche
+    for l in low:
+        l["status"] = "REJECTED"
+        l["niche"] = niche
+
+    memory.save_leads(high + low)
+    return {"high_quality": high, "rejected": low}
+
+
+def route_function(state: LeadState) -> str:
+    if state.get("high_quality"):
         return "outreach"
-    else:
-        if iterations > 3:
-            return "END"
-        return "query_optimizer"
+    if (state.get("iteration") or 0) >= 3:
+        return END
+    return "query_optimizer"
 
-def query_optimizer(state: LeadState):
-    iteration = state.get("iteration", 0) + 1
-    niche = state.get("niche", "local businesses")
-    countries = state.get("countries") or ["Pakistan"]
+
+def query_optimizer(state: LeadState) -> dict:
+    iteration = (state.get("iteration") or 0) + 1
+    result = _dispatcher.send(_task(
+        "QueryGeneratorAgent",
+        niche=state.get("niche", "local businesses"),
+        countries=state.get("countries") or ["Pakistan"],
+    ))
     return {
         "iteration": iteration,
-        "queries": generate_queries(niche, countries),
+        "queries": result.first("queries") or [],
     }
 
 
-def outreach_agent(state: LeadState):
-    emails = []
-    for lead in state["high_quality"]:
-        emails.append(f"Email for {lead['title']}")
-
-    return {"emails": emails}
+def outreach_agent(state: LeadState) -> dict:
+    result = _dispatcher.send(_task(
+        "OutreachAgent",
+        high_quality=state.get("high_quality") or [],
+        niche=state.get("niche", "local businesses"),
+    ))
+    return {"emails": result.first("emails") or []}

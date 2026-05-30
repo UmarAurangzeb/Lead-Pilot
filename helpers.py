@@ -5,6 +5,9 @@ import os
 import random
 import subprocess
 from pathlib import Path
+from typing import Any
+
+import hashlib
 
 from apify_client import ApifyClient
 from dotenv import load_dotenv
@@ -12,12 +15,56 @@ from dotenv import load_dotenv
 from llm import client, DEFAULT_CHAT_MODEL
 from prompts import systemPrompts, userPrompts
 from schema import QueryResponse
-
+from utils.email_validation import fallback_emails_for_website, mx_filter
 _ROOT = Path(__file__).resolve().parent
 # Always load repo-root .env (notebook cwd is often notebook/, not LeadPilot/)
 load_dotenv(_ROOT / ".env")
 
 _EXTRACT_EMAILS_JS = _ROOT / "extractEmails.js"
+
+def _lead_hash(lead: dict[str, Any]) -> str:
+    key = "|".join(
+        [
+            (lead.get("title") or "").strip().lower(),
+            (lead.get("website") or "").strip().lower(),
+            (lead.get("address") or "").strip().lower(),
+        ]
+    )
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+import re as _re
+
+_EMAIL_RE = _re.compile(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$')
+_JUNK_PATTERNS = (
+    _re.compile(r'\.(png|jpg|jpeg|gif|svg|webp|ico|pdf|css|js)$', _re.I),
+    _re.compile(r'(example|placeholder|youremail|your@email|domain\.com|test@|noreply@no)', _re.I),
+    # Cloudflare email-protection beacon address (shows up when decode fails)
+    _re.compile(r'email-protection@', _re.I),
+    # Sentry / WordPress / Wix / hosting platform noise
+    _re.compile(r'@(sentry\.io|wixpress\.com|wordpress\.com|wpengine\.com|squarespace\.com|godaddy\.com|cloudflare\.com)$', _re.I),
+)
+
+
+def normalize_email_list(raw: Any) -> list[str]:
+    """Flatten scraped email fields into distinct, validated addresses."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for e in raw:
+        if not isinstance(e, str):
+            continue
+        e = e.strip().lstrip("%20").strip()
+        if not _EMAIL_RE.match(e):
+            continue
+        if any(p.search(e) for p in _JUNK_PATTERNS):
+            continue
+        out.append(e)
+    return list(dict.fromkeys(out))
+
+
 def complete_query_response(system_prompt: str, user_prompt: str) -> QueryResponse:
     """Structured completion; API + Pydantic enforce QueryResponse (incl. list length)."""
     completion = client.beta.chat.completions.parse(
@@ -98,4 +145,22 @@ def enrich_leads_with_emails(raw_leads: list[dict]) -> list[dict]:
     if proc.returncode != 0:
         msg = proc.stderr.decode("utf-8", errors="replace")[:800]
         raise RuntimeError(f"extractEmails.js failed (exit {proc.returncode}): {msg}")
-    return json.loads(proc.stdout.decode("utf-8"))
+
+    scraped = json.loads(proc.stdout.decode("utf-8"))
+    skip_mx = os.getenv("EMAIL_MX_CHECK", "true").lower() in ("0", "false", "no")
+    skip_fallback = os.getenv("EMAIL_PATTERN_FALLBACK", "true").lower() in ("0", "false", "no")
+
+    enriched = []
+    for lead in scraped:
+        emails = normalize_email_list(lead.get("emails"))
+        if not skip_mx and emails:
+            emails = mx_filter(emails)
+
+        if not emails and not skip_fallback:
+            candidates = fallback_emails_for_website(lead.get("website"))
+            emails = normalize_email_list(candidates)
+
+        enriched.append({**lead, "emails": emails})
+    return enriched
+
+  
